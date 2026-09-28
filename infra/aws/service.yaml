@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  pr-review-agent service (one stack per environment): ECS Fargate behind an ALB, Claude
+  on Amazon Bedrock, Bedrock Knowledge Base RAG, DynamoDB HITL queue, CloudWatch
+  metrics/alarms. Deployed by .github/workflows/deploy.yml.
+
+Parameters:
+  EnvName:
+    Type: String
+    AllowedValues: [staging, prod]
+  ImageUri:
+    Type: String
+    Description: ECR image URI including the git-sha tag
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in different AZs
+  AgentModel:
+    Type: String
+    Default: claude-opus-5
+  KnowledgeBaseId:
+    Type: String
+    Default: ""
+    Description: Bedrock Knowledge Base ID. Empty = use the bundled local BM25 index.
+  AppSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager secret (JSON) with keys GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, API_KEY
+  HitlMode:
+    Type: String
+    AllowedValues: [always, unverified_only, never]
+    Default: always
+  DesiredCount:
+    Type: Number
+    Default: 1
+  AlarmEmail:
+    Type: String
+    Default: ""
+
+Conditions:
+  UseKb: !Not [!Equals [!Ref KnowledgeBaseId, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- data
+  ReviewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pr-review-agent-${EnvName}-reviews
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /pr-review-agent/${EnvName}
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------- IAM
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pr-review-agent-${EnvName}-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-app-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecretArn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pr-review-agent-${EnvName}-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Claude
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"   # TODO: scope to model / inference-profile ARNs
+              - Sid: Rag
+                Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+              - Sid: Guardrails
+                Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*
+              - Sid: Hitl
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ReviewsTable.Arn
+                  - !Sub ${ReviewsTable.Arn}/index/*
+
+  # ---------------------------------------------------------------- network
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: pr-review-agent ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: pr-review-agent tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: "300" }   # reviews can take minutes
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+
+  Listener:   # TODO: add an HTTPS listener with an ACM certificate before real use
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  # ---------------------------------------------------------------- compute
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub pr-review-agent-${EnvName}
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub pr-review-agent-${EnvName}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          PortMappings: [{ ContainerPort: 8000 }]
+          Environment:
+            - { Name: ENVIRONMENT, Value: !Ref EnvName }
+            - { Name: LLM_PROVIDER, Value: bedrock }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: AGENT_MODEL, Value: !Ref AgentModel }
+            - { Name: RAG_BACKEND, Value: !If [UseKb, bedrock_kb, local] }
+            - { Name: BEDROCK_KB_ID, Value: !Ref KnowledgeBaseId }
+            - { Name: HITL_BACKEND, Value: dynamodb }
+            - { Name: HITL_TABLE, Value: !Ref ReviewsTable }
+            - { Name: HITL_MODE, Value: !Ref HitlMode }
+          Secrets:
+            - { Name: GITHUB_TOKEN, ValueFrom: !Sub "${AppSecretArn}:GITHUB_TOKEN::" }
+            - { Name: GITHUB_WEBHOOK_SECRET, ValueFrom: !Sub "${AppSecretArn}:GITHUB_WEBHOOK_SECRET::" }
+            - { Name: API_KEY, ValueFrom: !Sub "${AppSecretArn}:API_KEY::" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }   # auto-rollback bad deploys
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup }
+
+  # ---------------------------------------------------------------- monitoring
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: !If
+        - HasAlarmEmail
+        - [{ Protocol: email, Endpoint: !Ref AlarmEmail }]
+        - !Ref AWS::NoValue
+
+  Http5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API returning 5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: p90 end-to-end review latency above 3 minutes
+      Namespace: PRReviewAgent
+      MetricName: ReviewLatencyMs
+      Dimensions:
+        - { Name: Environment, Value: !Ref EnvName }
+        - { Name: Stage, Value: review }
+      ExtendedStatistic: p90
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 180000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  HumanApprovalDriftAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >
+        Online quality signal - humans approve < 60% of reviews over a day (model, prompt or
+        KB drift). Investigate, add failing PRs to the golden eval set.
+      Namespace: PRReviewAgent
+      MetricName: HumanApproved
+      Dimensions:
+        - { Name: Environment, Value: !Ref EnvName }
+        - { Name: Stage, Value: hitl }
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 0.6
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub pr-review-agent-${EnvName}
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","width":12,"properties":{"title":"Findings / fixes","region":"${AWS::Region}","stat":"Sum","period":3600,
+            "metrics":[["PRReviewAgent","Findings","Environment","${EnvName}","Stage","review"],[".","FixesProposed",".",".",".","."],[".","FixesVerified",".",".",".","."]]}},
+          {"type":"metric","width":12,"properties":{"title":"Latency p50/p90 (ms)","region":"${AWS::Region}","period":3600,
+            "metrics":[["PRReviewAgent","ReviewLatencyMs","Environment","${EnvName}","Stage","review",{"stat":"p50"}],["...",{"stat":"p90"}]]}},
+          {"type":"metric","width":12,"properties":{"title":"Tokens","region":"${AWS::Region}","stat":"Sum","period":3600,
+            "metrics":[["PRReviewAgent","InputTokens","Environment","${EnvName}","Stage","review"],[".","OutputTokens",".",".",".","."]]}},
+          {"type":"metric","width":12,"properties":{"title":"Human approval rate","region":"${AWS::Region}","stat":"Average","period":86400,
+            "metrics":[["PRReviewAgent","HumanApproved","Environment","${EnvName}","Stage","hitl"]]}}
+        ]}
+
+Outputs:
+  ServiceUrl:
+    Value: !Sub http://${LoadBalancer.DNSName}
+  ReviewsTableName:
+    Value: !Ref ReviewsTable
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=pr-review-agent-${EnvName}

@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  pr-review-agent bootstrap (deploy once): ECR repo, artifact + knowledge-base buckets,
+  GitHub Actions OIDC deploy role, and the CloudFormation execution role.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: owner/repo allowed to assume the deploy role, e.g. acme/pr-review-agent
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set false if token.actions.githubusercontent.com already exists in this account
+
+Conditions:
+  MakeOidc: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: pr-review-agent
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >
+          {"rules":[{"rulePriority":1,"description":"keep last 30 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},
+          "action":{"type":"expire"}}]}
+
+  ArtifactsBucket:            # eval reports + release manifests (the "model registry")
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  KnowledgeBaseBucket:        # source docs for the Bedrock Knowledge Base (scripts/sync_kb.py)
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  GitHubOidc:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # Role CloudFormation assumes to create the service stack (so the GitHub role itself
+  # never needs broad IAM rights).
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: manage-service-roles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/pr-review-agent-*
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pr-review-agent-github-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:*
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Ecr
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt EcrRepo.Arn
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/pr-review-agent-*/*
+              - Sid: PassCfnRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecutionRole.Arn
+              - Sid: Artifacts
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:DeleteObject]
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
+                  - !GetAtt KnowledgeBaseBucket.Arn
+                  - !Sub ${KnowledgeBaseBucket.Arn}/*
+              - Sid: BedrockEvalsAndKbSync
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Retrieve
+                  - bedrock:StartIngestionJob
+                  - bedrock:GetIngestionJob
+                Resource: "*"   # TODO: scope to model / inference-profile / KB ARNs
+
+Outputs:
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepo.RepositoryUri
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+  KnowledgeBaseBucketName:
+    Value: !Ref KnowledgeBaseBucket
+  GitHubDeployRoleArn:
+    Value: !GetAtt GitHubDeployRole.Arn
+  CfnExecutionRoleArn:
+    Value: !GetAtt CfnExecutionRole.Arn

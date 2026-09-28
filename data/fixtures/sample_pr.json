@@ -1,0 +1,19 @@
+{
+  "repo": "acme/shop-api",
+  "number": 42,
+  "title": "Add user lookup endpoint",
+  "description": "Adds user lookup, profile fetch and a small dedupe helper.",
+  "author": "dev1",
+  "files": [
+    {
+      "path": "app/users.py",
+      "status": "modified",
+      "patch": "@@ -1,1 +1,18 @@\n import sqlite3\n+import requests\n+\n+DB_PASSWORD = \"hunter2-prod\"\n+\n+def get_user(conn, name):\n+    cur = conn.cursor()\n+    cur.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n+    print(\"looking up\", name)\n+    return cur.fetchone()\n+\n+def load_all(conn):\n+    try:\n+        return conn.execute(\"SELECT * FROM users\").fetchall()\n+    except Exception: pass\n+\n+def fetch_profile(url):\n+    return requests.get(url).json()\n"
+    },
+    {
+      "path": "app/cache.py",
+      "status": "added",
+      "patch": "@@ -0,0 +1,6 @@\n+# TODO: add TTL\n+def dedupe(items, seen):\n+    for a in items:\n+        for b in seen:\n+            if a == b: return True\n+    return False\n"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+# CI: unit tests + offline eval gate on every PR; real-model eval gate on Bedrock for PRs
+# and nightly (catches model / prompt / knowledge-base drift).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write          # OIDC -> AWS (no long-lived keys)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv && uv pip install -e ".[dev]"
+      - run: .venv/bin/ruff check src tests scripts
+      - run: .venv/bin/pytest -q
+      - name: Offline eval gate (mock LLM - pipeline regression test)
+        run: .venv/bin/pr-review eval --gate
+      - name: Lint CloudFormation
+        run: uvx cfn-lint infra/aws/*.yaml
+
+  bedrock-eval:
+    # Real quality gate: Claude on Bedrock against the golden set + thresholds.
+    needs: test
+    if: >-
+      vars.BEDROCK_EVALS == 'true' && github.event_name != 'push' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: bedrock
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AGENT_MODEL: ${{ vars.AGENT_MODEL || 'claude-opus-5' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv && uv pip install -e .
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Eval gate on Bedrock
+        shell: bash
+        run: |
+          .venv/bin/pr-review eval --gate | tee eval.txt
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          { echo '### Eval results (Bedrock)'; echo '```'; cat eval.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report-bedrock
+          path: evals/reports/latest.json

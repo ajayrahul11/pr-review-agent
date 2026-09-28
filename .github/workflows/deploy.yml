@@ -1,0 +1,140 @@
+# CD: eval gate (Bedrock) -> build image -> sync knowledge base -> staging + smoke test
+#     -> manual approval -> prod + smoke test -> release manifest.
+# Rollback: run this workflow manually with `image_tag` = a previous git sha.
+name: deploy
+
+on:
+  # Manual-only until the AWS setup in infra/aws/README.md is done. Then re-enable:
+  # push:
+  #   branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Redeploy an existing image tag (rollback). Skips eval + build."
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  IMAGE: ${{ vars.ECR_REPOSITORY_URI }}:${{ inputs.image_tag || github.sha }}
+
+jobs:
+  eval-gate:
+    if: inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: bedrock
+      AGENT_MODEL: ${{ vars.AGENT_MODEL || 'claude-opus-5' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv && uv pip install -e ".[dev]"
+      - run: .venv/bin/pytest -q
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Eval gate on Bedrock (blocks the release on regression)
+        shell: bash
+        run: .venv/bin/pr-review eval --gate | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: evals/reports/latest.json
+
+  build:
+    needs: eval-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - run: |
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          docker push "$IMAGE"
+
+  kb-sync:
+    # RAG data pipeline: re-ingest the knowledge base into the Bedrock Knowledge Base.
+    needs: eval-gate
+    if: vars.KB_ID != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv && uv pip install -e .
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: >
+          .venv/bin/python scripts/sync_kb.py --bucket "${{ vars.KB_BUCKET }}"
+          --kb-id "${{ vars.KB_ID }}" --data-source-id "${{ vars.KB_DATA_SOURCE_ID }}"
+          --region "$AWS_REGION"
+
+  deploy-staging:
+    needs: [build, kb-sync]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy stack
+        run: &deploy |
+          aws cloudformation deploy \
+            --stack-name "pr-review-agent-${{ vars.ENV_NAME }}" \
+            --template-file infra/aws/service.yaml \
+            --role-arn "${{ vars.CFN_EXEC_ROLE_ARN }}" \
+            --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              EnvName="${{ vars.ENV_NAME }}" ImageUri="$IMAGE" \
+              VpcId="${{ vars.VPC_ID }}" PublicSubnetIds="${{ vars.PUBLIC_SUBNET_IDS }}" \
+              AppSecretArn="${{ vars.APP_SECRET_ARN }}" KnowledgeBaseId="${{ vars.KB_ID }}" \
+              AgentModel="${{ vars.AGENT_MODEL || 'claude-opus-5' }}" \
+              HitlMode="${{ vars.HITL_MODE || 'always' }}" AlarmEmail="${{ vars.ALARM_EMAIL }}"
+      - name: Smoke test (one real review through all four agents)
+        run: &smoke |
+          BASE_URL=$(aws cloudformation describe-stacks --stack-name "pr-review-agent-${{ vars.ENV_NAME }}" \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" --output text)
+          BASE_URL="$BASE_URL" API_KEY="${{ secrets.API_KEY }}" ./scripts/smoke_test.sh
+
+  deploy-prod:
+    needs: deploy-staging
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    environment: production        # configure required reviewers = manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy stack
+        run: *deploy
+      - name: Smoke test
+        run: *smoke
+      - uses: actions/download-artifact@v4
+        if: inputs.image_tag == ''
+        with:
+          name: eval-report
+          path: evals/reports
+      - name: Publish release manifest (model registry record)
+        if: inputs.image_tag == ''
+        run: |
+          pip install boto3
+          python scripts/release_manifest.py --bucket "${{ vars.ARTIFACTS_BUCKET }}" \
+            --image "$IMAGE" --env "${{ vars.ENV_NAME }}"

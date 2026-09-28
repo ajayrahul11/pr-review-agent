@@ -1,0 +1,12 @@
+# Eval gate. CI and the deploy pipeline fail if any metric falls below its minimum.
+# Raise these as the golden set grows; never lower them to make a release pass.
+[min]
+retrieval_recall   = 0.90   # Agent 1: expected rules retrieved
+review_precision   = 0.85   # Agent 2: reported findings that are real
+review_recall      = 0.80   # Agent 2: real violations found
+fix_success_rate   = 0.80   # Agent 3+4: expected fixes proposed, verified and correct
+verifier_accuracy  = 1.00   # Agent 4: verdicts match labels (bad fixes must never pass)
+guardrail_pass_rate = 1.00
+
+[max]
+avg_latency_ms     = 120000
