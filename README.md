@@ -46,7 +46,56 @@ running on Amazon Bedrock.
 
 ---
 
+## Code flow
+
+`pr-review review` ([cli.py](src/pr_review_agent/cli.py)) and `POST /reviews`
+([api/main.py](src/pr_review_agent/api/main.py)) are the two front ends — both just call
+`workflow.orchestrator.run_review(pr)`, which is the only place the pipeline is sequenced:
+
+1. **CLI/API entry** loads the PR — `integrations/github.load_fixture` (a JSON fixture) or
+   `fetch_pull_request` (a live GitHub PR) — and calls `run_review(pr)`.
+2. **`run_review`** ([workflow/orchestrator.py](src/pr_review_agent/workflow/orchestrator.py)):
+   - `guardrails.input_guards.check_input(pr)` — redacts secrets, flags prompt-injection
+     attempts in the diff/description, enforces `MAX_DIFF_CHARS`. A violation short-circuits
+     the review to `blocked` before any agent runs.
+   - `RetrieverAgent().retrieve(pr)` — **Agent 1**.
+   - `ReviewerAgent().review(pr, context)` — **Agent 2** — then
+     `guardrails.output_guards.check_findings(...)`: drops findings that don't cite a
+     retrieved rule_id, aren't on an added line, fall below `MIN_CONFIDENCE_TO_POST`, or
+     duplicate another finding.
+   - `FixerAgent().propose(pr, findings)` — **Agent 3**, only for findings whose rule is
+     `fixable`.
+   - `VerifierAgent().verify(...)` — **Agent 4**: static checks (original text still
+     matches the PR, the rule's `detect` regex no longer fires, the fix parses, it's under
+     `MAX_FIX_LINES`, no secrets) followed by an LLM sanity check.
+3. Every agent subclasses **`agents/base.py:Agent`**, which runs the actual Claude tool-use
+   loop: call the model with its versioned system prompt (`prompts/`) and its own
+   `allowed_tools` → execute any `tool_use` blocks → feed results back → repeat until the
+   model calls its `submit_*` tool (structured output) or `max_agent_turns` is hit. A tool
+   outside an agent's allowlist is blocked and reported back to the model as an error —
+   enforced in code, not just in the prompt.
+4. Tools are resolved through `mcp_tools.provider.get_tool_provider()`: `MCP_MODE=inprocess`
+   (default) calls the Python functions in `mcp_tools/tools.py` directly; `MCP_MODE=stdio`
+   spawns `mcp_tools/server.py` and talks MCP over stdio instead — same tools, different
+   transport. The retriever's `search_knowledge_base`/`get_rule` tools call
+   `rag.retriever.get_retriever()` — `LocalBM25Retriever` (BM25 over
+   `rag/knowledge.py:load_rules()`, i.e. `knowledge_base/**/*.md`) or `BedrockKBRetriever`,
+   depending on `RAG_BACKEND`.
+5. Back in `run_review`, the **HITL gate** decides what happens next: `HITL_MODE=always`,
+   or a prompt-injection guardrail event, or (`unverified_only` + an unverified fix) →
+   `pending_approval`, held in `hitl/store.py` (SQLite or DynamoDB) until
+   `pr-review approve/reject` (or `POST /reviews/{id}/decision`) calls
+   `orchestrator.decide(...)`. Otherwise the review is auto-`approved` and `publish(review)`
+   posts it immediately via `integrations/github.post_review` (a PR review comment with a
+   `` ```suggestion ``` `` block per verified fix).
+6. Every stage's latency, token counts and pass/fail counts land on `review.metrics` and go
+   to CloudWatch EMF via `observability.emit`; `review.trace` keeps a human-readable log of
+   every tool call and agent decision for debugging a specific review.
+
 ## 1. Run locally (no keys needed)
+
+Prerequisites: Python 3.11+ and [uv](https://docs.astral.sh/uv/) (`make install` runs
+`uv venv && uv pip install -e ".[dev]"`).
 
 `LLM_PROVIDER=mock` runs all four agents offline with a deterministic stand-in for Claude.
 The Retriever still makes real knowledge-base searches through the MCP tools.
